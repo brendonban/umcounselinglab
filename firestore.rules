@@ -1,0 +1,242 @@
+rules_version = '2';
+
+// UM Counseling Lab booking rules.
+// The website is just a page in the browser, so every booking rule that matters is checked here,
+// on Google's servers, where nobody can switch it off.
+//
+//   admins/{email}     who can open the admin console (add these by hand in the Firebase console)
+//   bookings/{code}    one booking, readable by its owner and admins
+//   slots/{date_HH_room}  one document per room-hour that is booked. It can only be created if it
+//                      doesn't exist yet, which is what makes double booking impossible.
+//   closures/{date}    closed rooms or hours on one day. items is a map keyed "HH_room", "HH_all",
+//                      "all_room" or "all_all" (e.g. "14_3" = Room 3 at 2 pm, "all_all" = whole lab all day).
+//   profiles/{uid}     a student's saved details
+//   tickets/{id}       support tickets
+//   survey/{id}        anonymous feedback
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- who is asking
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true
+        && request.auth.token.firebase.sign_in_provider == 'google.com';
+    }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function umUser() { return signedIn() && myEmail().matches('^[^@]+@(siswa[.])?um[.]edu[.]my$'); }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(myEmail())); }
+
+    // ---------------------------------------------------------------- helpers
+    function bookingPath(code) { return /databases/$(database)/documents/bookings/$(code); }
+    function slotPath(key) { return /databases/$(database)/documents/slots/$(key); }
+    function pad2(h) { return h < 10 ? '0' + string(h) : string(h); }
+    function slotKey(b, h) { return b.date + '_' + pad2(h) + '_' + b.room; }
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+
+    // Midnight in Malaysia (UTC+8) at the start of a "YYYY-MM-DD" day.
+    function dayStart(date) {
+      let p = date.split('-');
+      return timestamp.date(int(p[0]), int(p[1]), int(p[2])) - duration.value(8, 'h');
+    }
+    function startsAt(b) { return dayStart(b.date) + duration.value(b.hour, 'h'); }
+
+    // Keep these in step with SETTINGS in lib/settings.js.
+    function roomType(room) { return room in ['1', '10'] ? 'group' : 'individual'; }
+    function purposeOk(b) {
+      let P = {
+        'Individual counselling session': { 'max': 1, 'type': 'individual' },
+        'Group counselling session':      { 'max': 2, 'type': 'group' },
+        'Role-play / skills practice':    { 'max': 1, 'type': 'individual' },
+        'Supervision session':            { 'max': 1, 'type': 'individual' },
+        'Other academic purpose':         { 'max': 1, 'type': 'individual' }
+      };
+      return b.purpose in P
+        && roomType(b.room) == P[b.purpose].type
+        // Longer than the usual limit needs a written reason.
+        && (b.hours <= P[b.purpose].max || str(b.justification, 10, 1000));
+    }
+
+    // Each hour of the booking has its own slot, and they must all be created in the same write.
+    function slotsMatch(b) {
+      return b.slots is list && b.slots.size() == b.hours
+        && b.slots[0] == slotKey(b, b.hour)
+        && (b.hours < 2 || b.slots[1] == slotKey(b, b.hour + 1))
+        && (b.hours < 3 || b.slots[2] == slotKey(b, b.hour + 2))
+        && (b.hours < 4 || b.slots[3] == slotKey(b, b.hour + 3));
+    }
+    function slotsCreated(b, code) {
+      return getAfter(slotPath(b.slots[0])).data.code == code
+        && (b.hours < 2 || getAfter(slotPath(b.slots[1])).data.code == code)
+        && (b.hours < 3 || getAfter(slotPath(b.slots[2])).data.code == code)
+        && (b.hours < 4 || getAfter(slotPath(b.slots[3])).data.code == code);
+    }
+    // Closed by an admin? One read of that day's closures document covers every hour of the booking.
+    function hourClosed(items, b, h) { return (pad2(h) + '_' + b.room) in items || (pad2(h) + '_all') in items; }
+    function notClosed(b) {
+      let p = /databases/$(database)/documents/closures/$(b.date);
+      return !exists(p) || openIn(get(p).data.items, b);
+    }
+    function openIn(items, b) {
+      return !('all_all' in items) && !(('all_' + b.room) in items)
+        && !hourClosed(items, b, b.hour)
+        && (b.hours < 2 || !hourClosed(items, b, b.hour + 1))
+        && (b.hours < 3 || !hourClosed(items, b, b.hour + 2))
+        && (b.hours < 4 || !hourClosed(items, b, b.hour + 3));
+    }
+    function slotsReleased(b) {
+      return !existsAfter(slotPath(b.slots[0]))
+        && (b.hours < 2 || !existsAfter(slotPath(b.slots[1])))
+        && (b.hours < 3 || !existsAfter(slotPath(b.slots[2])))
+        && (b.hours < 4 || !existsAfter(slotPath(b.slots[3])));
+    }
+
+    function validNewBooking(b, code) {
+      return b.keys().hasOnly(['code', 'uid', 'email', 'date', 'hour', 'hours', 'room', 'purpose', 'name', 'studentId',
+                               'phone', 'people', 'supervisor', 'notes', 'justification', 'status', 'slots', 'bookedAt'])
+        && b.keys().hasAll(['code', 'uid', 'email', 'date', 'hour', 'hours', 'room', 'purpose', 'name', 'studentId', 'status', 'slots', 'bookedAt'])
+        && b.code == code && code.matches('^[A-Z0-9]{6}$')
+        && b.uid == request.auth.uid && b.email == myEmail()
+        && b.status == 'Confirmed' && b.bookedAt == request.time
+        // Opening hours: 9.00 am to 9.00 pm, one-hour blocks, up to 4 hours.
+        && b.date is string && b.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && b.hour is int && b.hours is int && b.hours >= 1 && b.hours <= 4
+        && b.hour >= 9 && b.hour + b.hours <= 21
+        // Rooms 1-8 and 10. Room 9 can't be booked.
+        && b.room in ['1', '2', '3', '4', '5', '6', '7', '8', '10']
+        && purposeOk(b)
+        // At least one day ahead (tomorrow or later, Malaysia time), and no more than 14 days out.
+        && dayStart(b.date) > request.time
+        && dayStart(b.date) <= request.time + duration.value(14, 'd')
+        // Name and matric number are required.
+        && str(b.name, 2, 120) && str(b.studentId, 3, 30)
+        && (!('phone' in b) || str(b.phone, 0, 30))
+        && (!('people' in b) || (b.people is int && b.people >= 1 && b.people <= 12))
+        && (!('supervisor' in b) || str(b.supervisor, 0, 120))
+        && (!('notes' in b) || str(b.notes, 0, 1000))
+        && (!('justification' in b) || str(b.justification, 0, 1000))
+        && slotsMatch(b) && slotsCreated(b, code) && notClosed(b);
+    }
+
+    // ---------------------------------------------------------------- admins
+    match /admins/{email} {
+      // You can check whether you are an admin. Admins are added by hand in the Firebase console.
+      allow get: if signedIn() && email == myEmail();
+      allow list, write: if false;
+    }
+
+    // ---------------------------------------------------------------- bookings
+    match /bookings/{code} {
+      allow get, list: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+
+      allow create: if (umUser() || isAdmin()) && validNewBooking(request.resource.data, code);
+
+      // A student can cancel their own booking before it starts. Its slots must be freed in the same write.
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'Confirmed'
+        && request.time < startsAt(resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt'])
+        && request.resource.data.status == 'Cancelled'
+        && request.resource.data.cancelledAt == request.time
+        && slotsReleased(resource.data);
+
+      // Admins can change the status (attended, no-show, cancelled, restored). Nothing else.
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt', 'statusBy', 'statusAt'])
+        && request.resource.data.status in ['Confirmed', 'Attended', 'No-show', 'Cancelled']
+        && request.resource.data.statusBy == myEmail()
+        && request.resource.data.statusAt == request.time
+        && (!('cancelledAt' in request.resource.data.diff(resource.data).affectedKeys()) || request.resource.data.cancelledAt == request.time)
+        // Cancelling frees the room-hours; restoring a cancelled booking must take them back.
+        && (request.resource.data.status != 'Cancelled' || slotsReleased(resource.data))
+        && (resource.data.status != 'Cancelled' || request.resource.data.status == 'Cancelled' || slotsCreated(resource.data, code));
+
+      // Nobody can erase a booking. Cancelled bookings stay on record.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- slots (what's taken)
+    match /slots/{key} {
+      // Anyone can see which room-hours are taken. Slots hold no names or contact details.
+      allow get, list: if true;
+
+      // Only created alongside its booking, and never over an existing slot (that would be an update).
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['code', 'date'])
+        && request.resource.data.code is string
+        && slotFitsBooking(key, request.resource.data);
+
+      // Freed when its booking is cancelled, by the owner or an admin.
+      allow delete: if signedIn() && bookingCancelledBy(resource.data.code);
+
+      allow update: if false;
+    }
+    function slotFitsBooking(key, d) {
+      let bk = getAfter(bookingPath(d.code)).data;
+      return key in bk.slots && bk.date == d.date && bk.status != 'Cancelled'
+        && (bk.uid == request.auth.uid || isAdmin());
+    }
+    function bookingCancelledBy(code) {
+      let bk = getAfter(bookingPath(code)).data;
+      return bk.status == 'Cancelled' && (bk.uid == request.auth.uid || isAdmin());
+    }
+
+    // ---------------------------------------------------------------- closures
+    match /closures/{date} {
+      allow get, list: if true;
+      allow create, update: if isAdmin()
+        && date.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}')
+        && request.resource.data.keys().hasOnly(['date', 'items'])
+        && request.resource.data.date == date
+        && request.resource.data.items is map
+        && request.resource.data.items.size() <= 120;
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------- profiles
+    match /profiles/{uid} {
+      allow get: if signedIn() && (uid == request.auth.uid || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if (umUser() || isAdmin()) && uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['email', 'name', 'studentId', 'phone', 'programme', 'supervisor', 'updatedAt'])
+        && request.resource.data.email == myEmail()
+        && str(request.resource.data.name, 2, 120) && str(request.resource.data.studentId, 3, 30)
+        && str(request.resource.data.phone, 0, 30) && str(request.resource.data.programme, 0, 120)
+        && str(request.resource.data.supervisor, 0, 120)
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- support tickets
+    match /tickets/{id} {
+      // Anyone can open a ticket, signed in or not (a sign-in problem is a reason to open one).
+      allow create: if request.resource.data.keys().hasOnly(['id', 'type', 'page', 'subject', 'message', 'steps', 'name', 'email', 'signedIn', 'ua', 'status', 'at'])
+        && str(request.resource.data.id, 6, 20)
+        && str(request.resource.data.type, 1, 60) && str(request.resource.data.page, 0, 60)
+        && str(request.resource.data.subject, 3, 150) && str(request.resource.data.message, 10, 4000)
+        && str(request.resource.data.steps, 0, 2000) && str(request.resource.data.name, 0, 120)
+        && str(request.resource.data.email, 5, 200) && str(request.resource.data.ua, 0, 300)
+        && request.resource.data.signedIn == (request.auth != null && request.auth.token.email != null ? myEmail() : '')
+        && request.resource.data.status == 'Open' && request.resource.data.at == request.time;
+      allow get, list: if isAdmin();
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status in ['Open', 'In progress', 'Closed'];
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- feedback survey (anonymous)
+    match /survey/{id} {
+      allow create: if request.resource.data.keys().hasOnly(['answers', 'at'])
+        && request.resource.data.answers is map
+        && request.resource.data.answers.keys().hasOnly(['level', 'freq', 'ease', 'issues', 'other', 'want', 'switch'])
+        && request.resource.data.answers.size() <= 7
+        && str(request.resource.data.answers.get('other', ''), 0, 1500)
+        && str(request.resource.data.answers.get('issues', ''), 0, 1500)
+        && str(request.resource.data.answers.get('want', ''), 0, 1500)
+        && request.resource.data.at == request.time;
+      allow get, list: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}
